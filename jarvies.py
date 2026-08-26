@@ -1,0 +1,287 @@
+import base64
+import io
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import webbrowser
+from pathlib import Path
+
+import pyautogui
+import pyttsx3
+import requests
+from dotenv import load_dotenv
+from faster_whisper import WhisperModel
+from PIL import ImageGrab
+
+from audio import listen_once
+
+load_dotenv()
+
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
+MODEL = os.getenv("JARVIES_MODEL", "llama3.2:3b")
+VISION_MODEL = os.getenv("JARVIES_VISION_MODEL", "llama3.2-vision:11b")
+WHISPER_MODEL = os.getenv("JARVIES_WHISPER_MODEL", "base.en")
+WAKE_WORD = os.getenv("JARVIES_WAKE_WORD", "jarvies").lower()
+
+APP_ALIASES = {
+    "youtube": "https://www.youtube.com",
+    "google": "https://www.google.com",
+    "gmail": "https://mail.google.com",
+    "github": "https://github.com",
+    "discord": "https://discord.com/app",
+    "spotify": "https://open.spotify.com",
+    "chatgpt": "https://chatgpt.com",
+    "whatsapp": "https://web.whatsapp.com",
+    "instagram": "https://www.instagram.com",
+    "facebook": "https://www.facebook.com",
+    "reddit": "https://www.reddit.com",
+    "netflix": "https://www.netflix.com",
+}
+
+engine = pyttsx3.init()
+engine.setProperty("rate", 175)
+
+print("Loading local speech model...")
+whisper = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
+print("JARVIES is ready.")
+
+
+def speak(text: str):
+    text = re.sub(r"\s+", " ", text).strip()
+    if not text:
+        return
+    print(f"JARVIES: {text}")
+    engine.say(text)
+    engine.runAndWait()
+
+
+def ollama_chat(prompt: str, model: str = MODEL) -> str:
+    response = requests.post(
+        f"{OLLAMA_URL}/api/chat",
+        json={
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": False,
+            "options": {"temperature": 0.2},
+        },
+        timeout=120,
+    )
+    response.raise_for_status()
+    return response.json()["message"]["content"].strip()
+
+
+def open_target(target: str):
+    target = target.strip().strip('"\'')
+    if target in APP_ALIASES:
+        webbrowser.open(APP_ALIASES[target])
+        return f"Opening {target}."
+
+    known_apps = {
+        "notepad": "notepad.exe",
+        "calculator": "calc.exe",
+        "paint": "mspaint.exe",
+        "file explorer": "explorer.exe",
+        "explorer": "explorer.exe",
+        "command prompt": "cmd.exe",
+        "cmd": "cmd.exe",
+        "powershell": "powershell.exe",
+        "settings": "ms-settings:",
+        "task manager": "taskmgr.exe",
+    }
+    if target in known_apps:
+        try:
+            if known_apps[target].endswith(":"):
+                os.startfile(known_apps[target])
+            else:
+                subprocess.Popen(known_apps[target], shell=True)
+            return f"Opening {target}."
+        except Exception as exc:
+            return f"I could not open {target}: {exc}"
+
+    if target.startswith(("http://", "https://")):
+        webbrowser.open(target)
+        return "Opening it."
+
+    webbrowser.open("https://www.google.com/search?q=" + requests.utils.quote(target))
+    return f"I searched for {target}."
+
+
+def search_web(query: str, service: str = "google"):
+    query = query.strip()
+    if service == "youtube":
+        url = "https://www.youtube.com/results?search_query=" + requests.utils.quote(query)
+    else:
+        url = "https://www.google.com/search?q=" + requests.utils.quote(query)
+    webbrowser.open(url)
+    return f"Searching {service} for {query}."
+
+
+def take_screenshot() -> bytes:
+    image = ImageGrab.grab(all_screens=True)
+    image.thumbnail((1800, 1100))
+    buffer = io.BytesIO()
+    image.save(buffer, format="JPEG", quality=78)
+    return buffer.getvalue()
+
+
+def inspect_screen(question: str) -> str:
+    image_bytes = take_screenshot()
+    image_b64 = base64.b64encode(image_bytes).decode("ascii")
+    try:
+        response = requests.post(
+            f"{OLLAMA_URL}/api/chat",
+            json={
+                "model": VISION_MODEL,
+                "messages": [{
+                    "role": "user",
+                    "content": (
+                        "You are JARVIES, a helpful Windows screen assistant. "
+                        "Describe only what is visible. If the user asks where to click, "
+                        "give precise UI guidance using visible labels and approximate "
+                        "screen position. Do not pretend you can see anything that is not "
+                        "in the screenshot. Keep the answer concise.\n\nQuestion: " + question
+                    ),
+                    "images": [image_b64],
+                }],
+                "stream": False,
+            },
+            timeout=180,
+        )
+        response.raise_for_status()
+        return response.json()["message"]["content"].strip()
+    except requests.RequestException:
+        return (
+            "My local vision model is not available. Install a vision model in Ollama, "
+            f"for example {VISION_MODEL}, then ask me to look at the screen again."
+        )
+
+
+def type_text(text: str):
+    pyautogui.write(text, interval=0.01)
+    return "Done."
+
+
+def press_key(key: str):
+    key = key.strip().lower().replace(" ", "_")
+    aliases = {"return": "enter", "escape": "esc", "control": "ctrl", "windows": "win"}
+    key = aliases.get(key, key)
+    allowed = {
+        "enter", "esc", "tab", "space", "backspace", "delete", "home", "end",
+        "up", "down", "left", "right", "ctrl", "shift", "alt", "win",
+        "f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8", "f9", "f10", "f11", "f12"
+    }
+    if key not in allowed and len(key) != 1:
+        return "I do not recognize that key."
+    pyautogui.press(key)
+    return f"Pressed {key.replace('_', ' ')}."
+
+
+def parse_command(command: str):
+    text = command.strip()
+    lower = text.lower()
+
+    if lower in {"stop", "quit", "exit", "goodbye", "shutdown jarvies"}:
+        return "exit", None
+
+    if re.search(r"(watch|look at|see|check|inspect|analy[sz]e).*(screen|display)", lower) or \
+       re.search(r"(where|what).*(click|button).*(screen|here)", lower):
+        return "screen", text
+
+    m = re.match(r"(?:open|launch|start)\s+(.+)$", text, re.I)
+    if m:
+        return "open", m.group(1)
+
+    m = re.match(r"(?:search|google)\s+(?:for\s+)?(.+)$", text, re.I)
+    if m:
+        return "search", m.group(1)
+
+    m = re.match(r"(?:search|find)\s+(?:youtube|on youtube)\s+(?:for\s+)?(.+)$", text, re.I)
+    if m:
+        return "youtube", m.group(1)
+
+    m = re.match(r"(?:type|write)\s+(.+)$", text, re.I)
+    if m:
+        return "type", m.group(1)
+
+    m = re.match(r"(?:press|hit)\s+(.+)$", text, re.I)
+    if m:
+        return "key", m.group(1)
+
+    m = re.match(r"(?:move|put)\s+(?:the\s+)?mouse\s+(?:to\s+)?(\d+)\s*[ ,]\s*(\d+)$", text, re.I)
+    if m:
+        return "mouse", (int(m.group(1)), int(m.group(2)))
+
+    return "ai", text
+
+
+def ai_fallback(command: str) -> str:
+    prompt = f"""You are JARVIES, a concise local Windows voice assistant.
+The user said: {command}
+Answer naturally in one or two sentences. Do not claim you performed an action unless the application actually did it. If the request needs an unsupported computer action, explain that briefly."""
+    try:
+        return ollama_chat(prompt)
+    except Exception:
+        return "I understood you, but my local AI model is not available. Please make sure Ollama is running."
+
+
+def handle(command: str):
+    action, value = parse_command(command)
+    if action == "exit":
+        speak("Goodbye. Standing by.")
+        return False
+    if action == "open":
+        speak(open_target(value))
+    elif action == "search":
+        speak(search_web(value))
+    elif action == "youtube":
+        speak(search_web(value, "youtube"))
+    elif action == "screen":
+        speak("One moment. I'm looking at your screen.")
+        speak(inspect_screen(value))
+    elif action == "type":
+        speak(type_text(value))
+    elif action == "key":
+        speak(press_key(value))
+    elif action == "mouse":
+        pyautogui.moveTo(*value, duration=0.2)
+        speak(f"Moving to {value[0]}, {value[1]}.")
+    else:
+        speak(ai_fallback(value))
+    return True
+
+
+def main():
+    speak("JARVIES online. Local systems are ready.")
+    print("Say 'JARVIES' followed by a command. Press Ctrl+C to stop.")
+    while True:
+        try:
+            audio = listen_once()
+            if not audio:
+                continue
+            segments, _ = whisper.transcribe(audio, beam_size=1, vad_filter=True)
+            transcript = " ".join(s.text.strip() for s in segments).strip()
+            if not transcript:
+                continue
+            print(f"You: {transcript}")
+            lower = transcript.lower()
+            if WAKE_WORD not in lower:
+                continue
+            command = re.sub(r"\b" + re.escape(WAKE_WORD) + r"\b[,:]?\s*", "", transcript, count=1, flags=re.I).strip()
+            if not command:
+                speak("Yes, sir. How can I help?")
+                continue
+            if not handle(command):
+                break
+        except KeyboardInterrupt:
+            print("\nJARVIES stopped.")
+            break
+        except Exception as exc:
+            print(f"Error: {exc}")
+            time.sleep(1)
+
+
+if __name__ == "__main__":
+    main()
