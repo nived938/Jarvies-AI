@@ -3,8 +3,10 @@ import io
 import os
 import re
 import subprocess
+import threading
 import time
 import webbrowser
+from queue import Queue
 
 import pyautogui
 import pyttsx3
@@ -138,8 +140,7 @@ def control_screen(command):
             return message
         print("JARVIES plan:", actions)
         speak(message + " I can perform the safe actions now.")
-        result = execute_actions(plan)
-        return result
+        return execute_actions(plan)
     except requests.RequestException:
         return f"I could not reach the local vision model. Make sure Ollama is running and {VISION_MODEL} is installed."
     except Exception as exc:
@@ -160,7 +161,7 @@ def press_key(key):
     if key not in allowed and len(key) != 1:
         return "I do not recognize that key."
     pyautogui.press(key)
-    return f"Pressed {key.replace('_', ' ')}."
+    return f"Pressed {key.replace('_', ' )')}".replace(" )", " ").strip() + "."
 
 
 def parse_command(command):
@@ -216,8 +217,7 @@ def handle(command):
     elif action == "screen":
         speak("One moment. I'm looking at your screen.")
         speak(inspect_screen(value))
-    elif action == "control":
-        speak(control_screen(value))
+    elif action == "control": speak(control_screen(value))
     elif action == "type": speak(type_text(value))
     elif action == "key": speak(press_key(value))
     elif action == "mouse":
@@ -227,10 +227,8 @@ def handle(command):
     return True
 
 
-def main():
-    speak("JARVIES online. Local systems are ready.")
-    print("Say 'JARVIES' followed by a command. Press Ctrl+C to stop.")
-    while True:
+def voice_loop(running):
+    while running.is_set():
         try:
             audio = listen_once()
             if audio is None:
@@ -239,7 +237,7 @@ def main():
             transcript = " ".join(s.text.strip() for s in segments).strip()
             if not transcript:
                 continue
-            print(f"You: {transcript}")
+            print(f"You (voice): {transcript}")
             if WAKE_WORD not in transcript.lower():
                 continue
             command = re.sub(r"\b" + re.escape(WAKE_WORD) + r"\b[,:]?\s*", "", transcript, count=1, flags=re.I).strip()
@@ -247,13 +245,37 @@ def main():
                 speak("Yes, sir. How can I help?")
                 continue
             if not handle(command):
+                running.clear()
                 break
-        except KeyboardInterrupt:
+        except Exception as exc:
+            print(f"Voice error: {exc}")
+            time.sleep(1)
+
+
+def main():
+    running = threading.Event()
+    running.set()
+    speak("JARVIES online. Local systems are ready.")
+    print("Voice mode: say 'JARVIES' followed by a command.")
+    print("Typing mode: type a command below without the wake word.")
+    print("Examples: open YouTube | search Minecraft | look at my screen | exit")
+    print("Press Ctrl+C to stop.\n")
+
+    voice_thread = threading.Thread(target=voice_loop, args=(running,), daemon=True)
+    voice_thread.start()
+
+    while running.is_set():
+        try:
+            command = input("You (type): ").strip()
+            if not command:
+                continue
+            if not handle(command):
+                running.clear()
+                break
+        except (KeyboardInterrupt, EOFError):
+            running.clear()
             print("\nJARVIES stopped.")
             break
-        except Exception as exc:
-            print(f"Error: {exc}")
-            time.sleep(1)
 
 
 if __name__ == "__main__":
