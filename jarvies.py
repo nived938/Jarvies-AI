@@ -14,6 +14,7 @@ from faster_whisper import WhisperModel
 from PIL import ImageGrab
 
 from audio import listen_once
+from computer_control import dangerous_request, execute_actions, plan_actions
 
 load_dotenv()
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
@@ -118,11 +119,31 @@ def inspect_screen(question):
                 "images": [image_b64],
             }],
             "stream": False,
-        }, timeout=180)
+        }, timeout=240)
         response.raise_for_status()
         return response.json()["message"]["content"].strip()
+    except requests.RequestException as exc:
+        return f"My local vision model is unavailable: {exc}"
+
+
+def control_screen(command):
+    if dangerous_request(command):
+        return "I will not perform destructive or sensitive actions automatically."
+    try:
+        speak("Scanning the screen and planning the action.")
+        plan = plan_actions(command)
+        message = plan.get("message", "I found an action plan.")
+        actions = plan.get("actions", [])
+        if not actions:
+            return message
+        print("JARVIES plan:", actions)
+        speak(message + " I can perform the safe actions now.")
+        result = execute_actions(plan)
+        return result
     except requests.RequestException:
-        return f"My local vision model is unavailable. Run: ollama pull {VISION_MODEL}"
+        return f"I could not reach the local vision model. Make sure Ollama is running and {VISION_MODEL} is installed."
+    except Exception as exc:
+        return f"I could not safely control the screen: {exc}"
 
 
 def type_text(text):
@@ -149,6 +170,10 @@ def parse_command(command):
         return "exit", None
     if re.search(r"(watch|look at|see|check|inspect|analy[sz]e).*(screen|display)", lower) or re.search(r"(where|what).*(click|button).*(screen|here)", lower):
         return "screen", text
+    if re.search(r"\b(click|press|tap|select|type|enter|scroll|move).*(on|in|the)\b", lower) and any(w in lower for w in ["screen", "browser", "page", "button", "box", "website"]):
+        return "control", text
+    if lower.startswith(("do it", "do that", "perform it", "click it", "go ahead")):
+        return "control", text
     m = re.match(r"(?:search|find)\s+(?:youtube|on youtube)\s+(?:for\s+)?(.+)$", text, re.I)
     if m:
         return "youtube", m.group(1)
@@ -191,6 +216,8 @@ def handle(command):
     elif action == "screen":
         speak("One moment. I'm looking at your screen.")
         speak(inspect_screen(value))
+    elif action == "control":
+        speak(control_screen(value))
     elif action == "type": speak(type_text(value))
     elif action == "key": speak(press_key(value))
     elif action == "mouse":
